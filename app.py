@@ -1,40 +1,61 @@
 import os
+import tempfile
+from pathlib import Path
+
 import streamlit as st
 from dotenv import load_dotenv
 
-# ============================================================
-# Environment Variables
-# ============================================================
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-load_dotenv()
-
-os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
+from rag import create_rag_chain
 
 
 # ============================================================
-# LangChain Imports
+# ENVIRONMENT VARIABLES
 # ============================================================
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_ollama import OllamaLLM
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+load_dotenv(ENV_FILE)
+
+GOOGLE_API_KEY = (
+    os.getenv("GOOGLE_API_KEY")
+    or os.getenv("GEMINI_API_KEY")
+)
+
+if not GOOGLE_API_KEY:
+
+    st.error(
+        f"""
+        Gemini API key not found.
+
+        Please check your .env file:
+
+        {ENV_FILE}
+        """
+    )
+
+    st.stop()
+
+os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 
 
 # ============================================================
-# Page Configuration
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="Gemma AI Chatbot",
-    page_icon="🤖",
-    layout="centered"
+    page_title="Document AI",
+    page_icon="📚",
+    layout="centered",
+    initial_sidebar_state="expanded"
 )
 
 
 # ============================================================
-# Custom CSS
+# CUSTOM CSS
 # ============================================================
 
 st.markdown(
@@ -42,71 +63,116 @@ st.markdown(
     <style>
 
     /* ========================================================
-       Remove User and Assistant Avatars
+       REMOVE CHAT AVATARS
        ======================================================== */
 
     [data-testid="stChatMessageAvatarUser"],
     [data-testid="stChatMessageAvatarAssistant"] {
+
         display: none;
+
     }
 
 
     /* ========================================================
-       Main Title
+       MAIN TITLE
        ======================================================== */
 
     .main-title {
+
         text-align: center;
-        font-size: 48px;
+
+        font-size: 46px;
+
         font-weight: 700;
-        margin-top: 30px;
-        margin-bottom: 8px;
+
+        margin-top: 25px;
+
+        margin-bottom: 5px;
+
     }
 
 
     /* ========================================================
-       Subtitle
+       SUBTITLE
        ======================================================== */
 
     .subtitle {
+
         text-align: center;
-        font-size: 17px;
+
+        font-size: 16px;
+
         color: #9ca3af;
+
         margin-bottom: 30px;
+
     }
 
 
     /* ========================================================
-       Move Chat Input Slightly Above Bottom
+       STATUS CARD
        ======================================================== */
 
-    [data-testid="stChatInput"] {
-        bottom: 42px;
+    .status-card {
+
+        padding: 15px;
+
+        border-radius: 10px;
+
+        margin-top: 15px;
+
+        margin-bottom: 15px;
+
+        border: 1px solid rgba(128,128,128,0.2);
+
     }
 
 
     /* ========================================================
-       Created By Footer
+       FOOTER
        ======================================================== */
 
     .footer {
+
         position: fixed;
+
         bottom: 5px;
+
         left: 0;
+
         right: 0;
+
         text-align: center;
+
         color: #9ca3af;
+
         font-size: 13px;
+
         z-index: 999;
+
     }
 
 
     /* ========================================================
-       Give Bottom Space For Chat Input + Footer
+       CHAT INPUT
+       ======================================================== */
+
+    [data-testid="stChatInput"] {
+
+        bottom: 35px;
+
+    }
+
+
+    /* ========================================================
+       BOTTOM SPACE
        ======================================================== */
 
     [data-testid="stAppViewContainer"] {
-        padding-bottom: 100px;
+
+        padding-bottom: 90px;
+
     }
 
     </style>
@@ -116,128 +182,391 @@ st.markdown(
 
 
 # ============================================================
-# Header
+# SESSION STATE
+# ============================================================
+
+if "messages" not in st.session_state:
+
+    st.session_state.messages = []
+
+
+if "rag_chain" not in st.session_state:
+
+    st.session_state.rag_chain = None
+
+
+if "documents_processed" not in st.session_state:
+
+    st.session_state.documents_processed = False
+
+
+if "document_names" not in st.session_state:
+
+    st.session_state.document_names = []
+
+
+if "chunk_count" not in st.session_state:
+
+    st.session_state.chunk_count = 0
+
+
+# ============================================================
+# HEADER
 # ============================================================
 
 st.markdown(
-    '<div class="main-title">🤖 Gemma AI Chatbot</div>',
+    '<div class="main-title">📚 Document AI</div>',
     unsafe_allow_html=True
 )
 
 st.markdown(
     '<div class="subtitle">'
-    'Powered by LangChain + Ollama + Gemma 2B'
+    'Upload your documents and ask questions using AI'
     '</div>',
     unsafe_allow_html=True
 )
 
 
 # ============================================================
-# Load Ollama Model
+# SIDEBAR
 # ============================================================
 
-llm = OllamaLLM(
-    model="gemma:2b"
-)
+with st.sidebar:
+
+    st.markdown("## 📄 Documents")
+
+    st.write(
+        "Upload one or more PDF documents "
+        "to start chatting."
+    )
+
+
+    # ========================================================
+    # FILE UPLOADER
+    # ========================================================
+
+    uploaded_files = st.file_uploader(
+        "Upload PDF files",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
+
+
+    # ========================================================
+    # PROCESS BUTTON
+    # ========================================================
+
+    process_button = st.button(
+        "🚀 Process Documents",
+        use_container_width=True
+    )
+
+
+    # ========================================================
+    # PROCESS DOCUMENTS
+    # ========================================================
+
+    if process_button:
+
+        if not uploaded_files:
+
+            st.warning(
+                "Please upload at least one PDF document."
+            )
+
+        else:
+
+            all_documents = []
+
+            progress_bar = st.progress(0)
+
+            status_text = st.empty()
+
+
+            # =================================================
+            # LOAD PDFs
+            # =================================================
+
+            total_files = len(uploaded_files)
+
+            for index, uploaded_file in enumerate(
+                uploaded_files
+            ):
+
+                status_text.info(
+                    f"Loading {uploaded_file.name}..."
+                )
+
+
+                # ------------------------------------------------
+                # Create temporary PDF
+                # ------------------------------------------------
+
+                with tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=".pdf"
+                ) as temp_file:
+
+                    temp_file.write(
+                        uploaded_file.getbuffer()
+                    )
+
+                    temp_path = temp_file.name
+
+
+                # ------------------------------------------------
+                # Load PDF
+                # ------------------------------------------------
+
+                try:
+
+                    loader = PyPDFLoader(
+                        temp_path
+                    )
+
+                    documents = loader.load()
+
+                    all_documents.extend(
+                        documents
+                    )
+
+                finally:
+
+                    # Remove temporary file
+                    if os.path.exists(temp_path):
+
+                        os.remove(temp_path)
+
+
+                # ------------------------------------------------
+                # Update progress
+                # ------------------------------------------------
+
+                progress = int(
+                    ((index + 1) / total_files) * 40
+                )
+
+                progress_bar.progress(
+                    progress
+                )
+
+
+            # =================================================
+            # SPLIT DOCUMENTS
+            # =================================================
+
+            status_text.info(
+                "Splitting documents into chunks..."
+            )
+
+
+            text_splitter = RecursiveCharacterTextSplitter(
+
+                chunk_size=1000,
+
+                chunk_overlap=200
+
+            )
+
+
+            chunks = text_splitter.split_documents(
+                all_documents
+            )
+
+
+            progress_bar.progress(60)
+
+
+            # =================================================
+            # CREATE RAG SYSTEM
+            # =================================================
+
+            status_text.info(
+                "Creating embeddings and FAISS vector database..."
+            )
+
+
+            try:
+
+                rag_chain = create_rag_chain(
+                    chunks
+                )
+
+
+                # ------------------------------------------------
+                # Store RAG chain
+                # ------------------------------------------------
+
+                st.session_state.rag_chain = rag_chain
+
+
+                # ------------------------------------------------
+                # Store document information
+                # ------------------------------------------------
+
+                st.session_state.documents_processed = True
+
+                st.session_state.document_names = [
+                    file.name
+                    for file in uploaded_files
+                ]
+
+                st.session_state.chunk_count = len(
+                    chunks
+                )
+
+
+                progress_bar.progress(100)
+
+
+                status_text.success(
+                    "Documents processed successfully! ✅"
+                )
+
+
+            except Exception as e:
+
+                st.error(
+                    f"Error while creating RAG system:\n\n{e}"
+                )
 
 
 # ============================================================
-# Chat History
+# SIDEBAR STATUS
 # ============================================================
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+with st.sidebar:
 
+    st.divider()
 
-# ============================================================
-# Prompt
-# ============================================================
+    if st.session_state.documents_processed:
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a helpful AI assistant. "
-            "Answer the user's questions clearly and accurately."
-        ),
-        (
-            "user",
-            """
-            Conversation history:
-            {history}
-
-            Current question:
-            {question}
-            """
+        st.success(
+            "🟢 Documents Ready"
         )
-    ]
-)
+
+
+        st.write(
+            f"📄 Files: "
+            f"{len(st.session_state.document_names)}"
+        )
+
+
+        st.write(
+            f"🧩 Chunks: "
+            f"{st.session_state.chunk_count}"
+        )
+
+
+        st.markdown("### Uploaded Files")
+
+        for file_name in st.session_state.document_names:
+
+            st.caption(
+                f"📄 {file_name}"
+            )
+
+    else:
+
+        st.info(
+            "Upload documents and click "
+            "**Process Documents**."
+        )
+
+
+    # ========================================================
+    # CLEAR CHAT
+    # ========================================================
+
+    st.divider()
+
+    if st.button(
+        "🗑️ Clear Conversation",
+        use_container_width=True
+    ):
+
+        st.session_state.messages = []
+
+        st.rerun()
 
 
 # ============================================================
-# Output Parser
+# DOCUMENT READY MESSAGE
 # ============================================================
 
-output_parser = StrOutputParser()
+if st.session_state.documents_processed:
+
+    st.markdown(
+        """
+        <div class="status-card">
+
+        🟢 <strong>Document knowledge base ready.</strong>
+
+        Ask questions about your uploaded files below.
+
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 
 # ============================================================
-# LangChain Chain
-# ============================================================
-
-chain = prompt | llm | output_parser
-
-
-# ============================================================
-# Display Previous Messages
+# DISPLAY CHAT HISTORY
 # ============================================================
 
 for message in st.session_state.messages:
 
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    with st.chat_message(
+        message["role"]
+    ):
+
+        st.markdown(
+            message["content"]
+        )
 
 
 # ============================================================
-# Chat Input
+# CHAT INPUT
 # ============================================================
 
 input_text = st.chat_input(
-    "Ask Gemma anything..."
+    "Ask something about your documents..."
 )
 
 
 # ============================================================
-# Created By
-# ============================================================
-
-st.markdown(
-    """
-    <div class="footer">
-        Created by <strong>Koushik Asrith Mulavisala</strong>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# Process User Question
+# PROCESS QUESTION
 # ============================================================
 
 if input_text:
 
-    # --------------------------------------------------------
-    # Display User Message
-    # --------------------------------------------------------
+    # ========================================================
+    # CHECK DOCUMENTS
+    # ========================================================
+
+    if not st.session_state.documents_processed:
+
+        st.warning(
+            "Please upload and process your documents first."
+        )
+
+        st.stop()
+
+
+    # ========================================================
+    # DISPLAY USER MESSAGE
+    # ========================================================
 
     with st.chat_message("user"):
-        st.markdown(input_text)
+
+        st.markdown(
+            input_text
+        )
 
 
-    # --------------------------------------------------------
-    # Store User Message
-    # --------------------------------------------------------
+    # ========================================================
+    # STORE USER MESSAGE
+    # ========================================================
 
     st.session_state.messages.append(
         {
@@ -247,48 +576,44 @@ if input_text:
     )
 
 
-    # --------------------------------------------------------
-    # Create Conversation History
-    # --------------------------------------------------------
-
-    history = ""
-
-    for message in st.session_state.messages[:-1]:
-
-        if message["role"] == "user":
-
-            history += (
-                f"User: {message['content']}\n"
-            )
-
-        elif message["role"] == "assistant":
-
-            history += (
-                f"Assistant: {message['content']}\n"
-            )
-
-
-    # --------------------------------------------------------
-    # Generate AI Response
-    # --------------------------------------------------------
+    # ========================================================
+    # GENERATE RESPONSE
+    # ========================================================
 
     with st.chat_message("assistant"):
 
-        with st.spinner("Thinking..."):
+        with st.spinner(
+            "Searching your documents..."
+        ):
 
-            response = chain.invoke(
-                {
-                    "history": history,
-                    "question": input_text
-                }
-            )
+            try:
 
-        st.markdown(response)
+                response = (
+                    st.session_state
+                    .rag_chain
+                    .invoke(input_text)
+                )
+
+                st.markdown(
+                    response
+                )
 
 
-    # --------------------------------------------------------
-    # Store Assistant Response
-    # --------------------------------------------------------
+            except Exception as e:
+
+                response = (
+                    "Sorry, I encountered an error "
+                    "while processing your question."
+                )
+
+                st.error(
+                    str(e)
+                )
+
+
+    # ========================================================
+    # STORE RESPONSE
+    # ========================================================
 
     st.session_state.messages.append(
         {
@@ -296,3 +621,20 @@ if input_text:
             "content": response
         }
     )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown(
+    """
+    <div class="footer">
+
+        Created by
+        <strong>Koushik Asrith Mulavisala</strong>
+
+    </div>
+    """,
+    unsafe_allow_html=True
+)
